@@ -1,6 +1,6 @@
 // 오프라인 사용을 위한 서비스 워커. HTTPS(예: GitHub Pages)에서만 등록된다.
 // 빌드할 때마다 VERSION이 바뀌어 새 앱 파일을 받는다.
-const VERSION = "c7d63fba65";
+const VERSION = "02e686e850";
 const FILES = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png", "./apple-touch-icon.png"];
 
 self.addEventListener("install", (e) => {

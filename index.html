@@ -139,9 +139,20 @@
   <p id="noStore" class="card" hidden style="border-color:#e0a000;background:#fff8e1;color:#5a4300">
     이 브라우저에서는 입력 내용을 저장할 수 없습니다. 창을 닫거나 새로고침하면 사진·내용이 사라지니,
     점검을 마치면 바로 <b>hwpx 만들어 저장</b>을 누르세요. (홈 화면에 추가한 앱으로 열면 저장됩니다)</p>
+  <p id="saveState" class="hint" hidden></p>
   <div id="list"></div>
   <button id="btnAdd" style="width:100%">+ 점검 건 추가</button>
-  <p class="hint" style="margin-top:14px">점검 1건에 사진 1~3장이 들어갑니다. 사진대지 1쪽에는 2건씩 배치됩니다.</p>
+  <p class="hint" style="margin-top:14px">점검 1건에 사진 1~3장이 들어갑니다. 사진대지 1쪽에는 2건씩 배치됩니다.
+    입력한 내용은 바로 휴대폰에 저장되므로, 앱을 닫았다가 다른 날 열어도 이어서 쓸 수 있습니다.</p>
+  <details class="card" id="backupBox" style="margin-top:6px">
+    <summary>작업 백업 (휴대폰 교체·데이터 삭제 대비)</summary>
+    <p class="hint">지금까지의 점검 건과 사진을 파일 하나로 저장했다가 다시 불러옵니다.
+      백업 파일에는 현장 사진이 들어 있으니 휴대폰 안('파일' 앱 등)에만 두고 외부에 올리지 마세요.</p>
+    <div class="row">
+      <button id="btnBackup" type="button" class="btnAlbum" style="margin:0">백업 파일 만들기</button>
+      <label class="btnAlbum" style="margin:0">백업 불러오기<input type="file" id="importBackup" accept=".json,application/json"></label>
+    </div>
+  </details>
   <button id="btnClear" class="danger" style="width:100%;margin-top:6px">전체 비우기</button>
 </main>
 
@@ -256,13 +267,35 @@ function dbAll() {
     } catch (e) { resolve([]); }
   });
 }
-function dbPut(item) {
+// 저장 결과를 화면의 '자동 저장됨' 표시에 반영한다.
+let lastSaved = null, saveFailed = false;
+function dbWrite(fn) {
   if (!db) return;
-  try { db.transaction("items", "readwrite").objectStore("items").put(item); } catch (e) {}
+  try {
+    const tx = db.transaction("items", "readwrite");
+    fn(tx.objectStore("items"));
+    tx.oncomplete = () => { lastSaved = new Date(); saveFailed = false; updateSaveState(); };
+    tx.onerror = tx.onabort = () => { saveFailed = true; updateSaveState(); };
+  } catch (e) { saveFailed = true; updateSaveState(); }
 }
-function dbDelete(id) {
-  if (!db) return;
-  try { db.transaction("items", "readwrite").objectStore("items").delete(id); } catch (e) {}
+function dbPut(item) { dbWrite((s) => s.put(item)); }
+function dbDelete(id) { dbWrite((s) => s.delete(id)); }
+function updateSaveState() {
+  const el = document.getElementById("saveState");
+  if (!db) { el.hidden = true; return; }
+  const used = items.filter((x) => x.photos.some(Boolean) || x.place || x.content);
+  const pics = used.reduce((n, x) => n + x.photos.filter(Boolean).length, 0);
+  el.hidden = false;
+  if (saveFailed) {
+    el.style.color = "var(--danger)";
+    el.textContent = "⚠ 저장하지 못했습니다(휴대폰 저장 공간 부족 등). 지금 'hwpx 만들어 저장'이나 '작업 백업'을 해 두세요.";
+    return;
+  }
+  el.style.color = "";
+  const when = lastSaved ? " · 마지막 저장 " + new Intl.DateTimeFormat("ko-KR", {
+    timeZone: "Asia/Seoul", month: "long", day: "numeric", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).format(lastSaved) : "";
+  el.textContent = `✔ 휴대폰에 자동 저장됨 · 점검 ${used.length}건 · 사진 ${pics}장${when}`;
 }
 
 // ---------- 날짜 (Asia/Seoul) ----------
@@ -866,6 +899,86 @@ document.getElementById("importSettings").onchange = async (ev) => {
     toast(e instanceof SyntaxError ? "설정 파일을 읽을 수 없습니다" : e.message, 4000);
   }
 };
+// ---------- 작업 백업 (점검 건 + 사진을 파일 하나로) ----------
+// 휴대폰 교체, 브라우저 데이터 삭제에 대비한다. 파일은 휴대폰에만 저장되며 어디로도 전송되지 않는다.
+const BACKUP_KIND = "photo_report_backup";
+const MAX_BACKUP = 300 * 1024 * 1024;   // 백업 파일 최대 300MB
+const MAX_PHOTO_BYTES = 15 * 1024 * 1024;
+function blobToB64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(",")[1] || "");
+    r.onerror = () => reject(new Error("사진을 읽지 못했습니다"));
+    r.readAsDataURL(blob);
+  });
+}
+const usedItems = () => items.filter((x) => x.photos.some(Boolean) || x.place || x.content);
+document.getElementById("btnBackup").onclick = async () => {
+  const list = usedItems();
+  if (!list.length) return toast("백업할 점검 내용이 없습니다");
+  const btn = document.getElementById("btnBackup");
+  btn.disabled = true; btn.textContent = "만드는 중…";
+  try {
+    const out = [];
+    for (const x of list) {
+      const photos = [];
+      for (const p of x.photos) photos.push(p ? await blobToB64(p) : null);
+      out.push({ id: x.id, created: x.created, place: x.place, content: x.content, when: x.when, photos });
+    }
+    const data = { kind: BACKUP_KIND, version: 1, saved: seoulLocalValue(new Date()), items: out };
+    const file = new File([JSON.stringify(data)], `점검작업백업_${fileStamp()}.json`, { type: "application/json" });
+    const pics = list.reduce((n, x) => n + x.photos.filter(Boolean).length, 0);
+    if (await saveFiles([file], "작업 백업")) {
+      toast(`점검 ${list.length}건·사진 ${pics}장을 백업했습니다` + (IS_IOS ? " ('파일' 앱)" : " ('다운로드' 폴더)"), 4000);
+    }
+  } catch (e) { toast("백업 실패: " + e.message, 5000); }
+  finally { btn.disabled = false; btn.textContent = "백업 파일 만들기"; }
+};
+document.getElementById("importBackup").onchange = async (ev) => {
+  const f = ev.target.files[0];
+  ev.target.value = "";
+  if (!f) return;
+  try {
+    if (f.size > MAX_BACKUP) throw new Error("백업 파일이 너무 큽니다");
+    const d = JSON.parse(await f.text());
+    if (!d || d.kind !== BACKUP_KIND || !Array.isArray(d.items)) throw new Error("점검 사진대지 백업 파일이 아닙니다");
+    const clean = (s, n) => String(s ?? "").replace(/[\u0000-\u001f]/g, "").trim().slice(0, n);
+    const have = new Set(items.map((x) => x.id));
+    const loaded = [];
+    let skipped = 0;
+    for (const x of d.items.slice(0, 500)) {
+      if (!x || typeof x !== "object") continue;
+      const id = clean(x.id, 60) || newItem().id;
+      if (have.has(id)) { skipped++; continue; }   // 이미 있는 점검 건은 두 번 넣지 않는다
+      const photos = [];
+      for (const p of (Array.isArray(x.photos) ? x.photos : []).slice(0, MAX_PHOTOS)) {
+        let blob = null;
+        if (typeof p === "string" && p.length && p.length < MAX_PHOTO_BYTES * 1.4) {
+          const bytes = b64ToBytes(p);
+          if (bytes[0] === 0xff && bytes[1] === 0xd8) blob = new Blob([bytes], { type: "image/jpeg" }); // JPEG만 받는다
+        }
+        photos.push(blob);
+      }
+      while (photos.length < MAX_PHOTOS) photos.push(null);
+      const when = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/.test(x.when) ? x.when : "";
+      loaded.push({ id, created: Number.isFinite(x.created) ? x.created : Date.now(),
+        place: clean(x.place, 200), content: clean(x.content, 1000), when, photos });
+      have.add(id);
+    }
+    if (!loaded.length) return toast(skipped ? "백업의 점검 건이 이미 모두 들어 있습니다" : "백업에 점검 건이 없습니다", 4000);
+    const pics = loaded.reduce((n, x) => n + x.photos.filter(Boolean).length, 0);
+    if (!confirm(`백업에서 점검 ${loaded.length}건·사진 ${pics}장을 불러옵니다.\n지금 있는 점검 내용은 그대로 두고 함께 넣습니다.` +
+      (skipped ? `\n(이미 있는 ${skipped}건은 건너뜁니다)` : ""))) return;
+    // 아무것도 입력하지 않은 빈 점검 건은 정리한다.
+    items.filter((x) => !usedItems().includes(x)).forEach((x) => dbDelete(x.id));
+    items = usedItems().concat(loaded).sort((a, b) => a.created - b.created);
+    loaded.forEach(dbPut);
+    render(); updateSaveState();
+    toast(`점검 ${loaded.length}건을 불러왔습니다`, 3500);
+  } catch (e) {
+    toast(e instanceof SyntaxError ? "백업 파일을 읽을 수 없습니다" : e.message, 4000);
+  }
+};
 document.getElementById("btnSaveSettings").onclick = () => {
   settings.places = document.getElementById("setPlaces").value.split("\n").map((s) => s.trim()).filter(Boolean);
   settings.title = document.getElementById("setTitle").value.trim();
@@ -911,7 +1024,7 @@ document.getElementById("btnPhotos").onclick = async () => {
   // 이전 버전(사진 2칸)으로 저장된 점검 건도 3칸으로 맞춘다.
   items.forEach((x) => { while (x.photos.length < MAX_PHOTOS) x.photos.push(null); });
   if (!items.length) { items = [newItem()]; dbPut(items[0]); }
-  render();
+  render(); updateSaveState();
   if (!settings.name) {
     document.getElementById("btnSettings").click();
     toast("처음 한 번 점검자 직위·성명을 입력하고 저장해 주세요", 5000);
